@@ -1139,8 +1139,13 @@ func TestConfigValidationAndRegistrationMetadata(t *testing.T) {
 		t.Fatalf("registration = %#v", registration)
 	}
 	fields := map[string]pluginapi.ConfigFieldType{}
+	descriptions := map[string]string{}
 	for _, field := range registration.Metadata.ConfigFields {
 		fields[field.Name] = field.Type
+		descriptions[field.Name] = field.Description
+	}
+	if !strings.Contains(descriptions["protected-models"], "wildcard") {
+		t.Fatalf("protected-models metadata must document wildcard support, got %q", descriptions["protected-models"])
 	}
 	if fields["protected-models"] != pluginapi.ConfigFieldTypeArray ||
 		fields["cutoff-percent-used"] != pluginapi.ConfigFieldTypeNumber ||
@@ -1151,6 +1156,21 @@ func TestConfigValidationAndRegistrationMetadata(t *testing.T) {
 	}
 }
 
+// Coverage note for the TestCatduck* tests below (why they are not E2E):
+// these are table/boundary tests — the glob matcher matrix, every
+// combination of 5h/7d usage against distinct cutoffs, refresh queueing
+// for a blocked peer, and the post-reset failure category in
+// reset_pending_test.go. Each case would need its own compiled plugin +
+// CLIProxyAPI subprocess boot in the process E2E, which takes seconds per
+// boot and cannot drive the fake clock or inject per-token fetch failures,
+// so the full matrix cannot practicably be covered on the real path. The
+// behaviors they pin ARE covered end-to-end, with the windows
+// distinguished, by TestCLIProxyAPIProcessEndToEnd in
+// process_e2e_test.go: it boots the compiled .so under a real
+// cliproxyapi process, serves token-a as 5h-only-blocked and token-b as
+// 7d-only-blocked, and raises each cutoff separately to prove each window
+// gates independently. If that E2E is ever removed, these tests must move
+// with it or be replaced by an equivalent real-path test.
 func TestCatduckGlobModelMatching(t *testing.T) {
 	tests := []struct {
 		model     string

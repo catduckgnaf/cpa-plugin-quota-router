@@ -419,6 +419,44 @@ func TestResetPendingWaitIsBoundedAndUnfinishedReadCannotFallback(t *testing.T) 
 	f.release()
 }
 
+// Regression: after a five-hour-only reset, sample.ResetAt still points at
+// the future seven-day reset. A post-reset attempt (after the five-hour
+// reset, before the seven-day reset) must surface its recorded failure
+// category, not "unverified"; an attempt made before the five-hour reset
+// must still report "unverified".
+func TestResetPendingFailureUsesExpiredWindowReset(t *testing.T) {
+	now := time.Date(2026, time.October, 11, 12, 0, 0, 0, time.UTC)
+	fiveHourReset := now.Add(-time.Hour)
+	sevenDayReset := now.Add(48 * time.Hour)
+	sd20, fh95 := 20.0, 95.0
+	newRuntimeWithSample := func(attempt time.Time) *pluginRuntime {
+		runtime := newPluginRuntime(&fakeHost{}, nil, func() time.Time { return now })
+		runtime.cache.samples["auth-a"] = quotaSample{
+			HasSample:           true,
+			WeeklyPercentUsed:   sd20,
+			ResetAt:             sevenDayReset,
+			SevenDayPercentUsed: &sd20,
+			SevenDayResetAt:     sevenDayReset,
+			FiveHourPercentUsed: &fh95,
+			FiveHourResetAt:     fiveHourReset,
+			SampledAt:           fiveHourReset.Add(-time.Hour),
+			LastAttemptAt:       attempt,
+			LastErrorCategory:   pollErrorNetwork,
+		}
+		return runtime
+	}
+
+	postReset := newRuntimeWithSample(now.Add(-30 * time.Minute))
+	if got := postReset.resetPendingFailure("auth-a", now, 88, 94); got != pollErrorNetwork {
+		t.Fatalf("post-reset attempt after 5h-only reset = %q, want recorded category %q", got, pollErrorNetwork)
+	}
+
+	preReset := newRuntimeWithSample(fiveHourReset.Add(-time.Minute))
+	if got := preReset.resetPendingFailure("auth-a", now, 88, 94); got != "unverified" {
+		t.Fatalf("pre-reset attempt = %q, want %q", got, "unverified")
+	}
+}
+
 func TestResetPendingMissingCredentialDoesNotTriggerOutageFallback(t *testing.T) {
 	f := newStaleResetFixture(t, "poll-interval: 5m\n", time.Minute, false)
 	f.host.mu.Lock()

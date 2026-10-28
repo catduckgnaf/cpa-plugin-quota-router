@@ -188,7 +188,7 @@ func pluginRegistration() registration {
 				{
 					Name:        "protected-models",
 					Type:        pluginapi.ConfigFieldTypeArray,
-					Description: "Exact Claude model IDs whose routing is paused at the weekly cutoff. Default: [claude-fable-5].",
+					Description: "Claude model IDs or trailing wildcard patterns (e.g. claude-*, *) whose routing is paused at the cutoff. Default: [claude-fable-5].",
 				},
 				{
 					Name:        "cutoff-percent-used",

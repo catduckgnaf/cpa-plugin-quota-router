@@ -237,7 +237,19 @@ func (r *pluginRuntime) resetPendingFailure(authID string, now time.Time, cutoff
 	if r.pendingAll || r.inFlightAll || pending || inFlight {
 		return "read_pending"
 	}
-	if sample.LastAttemptAt.Before(sample.ResetAt) {
+	// The attempt must be compared with the reset of the window that
+	// actually expired, not sample.ResetAt: ResetAt tracks the seven-day
+	// window, so after a five-hour-only reset (seven-day reset still in
+	// the future) a genuine post-reset attempt would look pre-reset and
+	// its recorded failure category would be masked as "unverified".
+	postResetAttempt := false
+	for _, reset := range sample.expiredResets(now, cutoff, fiveHourCutoff) {
+		if !sample.LastAttemptAt.Before(reset) {
+			postResetAttempt = true
+			break
+		}
+	}
+	if !postResetAttempt {
 		return "unverified"
 	}
 	switch sample.LastErrorCategory {

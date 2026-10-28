@@ -57,24 +57,36 @@ func (s quotaSample) resetPending(now time.Time, cutoff float64) bool {
 }
 
 func (s quotaSample) resetPendingWindows(now time.Time, cutoff, fiveHourCutoff float64) bool {
+	return len(s.expiredResets(now, cutoff, fiveHourCutoff)) > 0
+}
+
+// expiredResets returns the reset time of each window that is at or above its
+// cutoff, was sampled before that reset, and whose reset has now passed. The
+// seven-day window falls back to the legacy WeeklyPercentUsed/ResetAt pair
+// only when no distinct seven-day metric is over its cutoff, mirroring the
+// original reset-pending rule. Callers that need to know *which* window
+// expired (rather than the conflated ResetAt, which tracks the seven-day
+// window) should use this instead of ResetAt.
+func (s quotaSample) expiredResets(now time.Time, cutoff, fiveHourCutoff float64) []time.Time {
 	if !s.HasSample {
-		return false
+		return nil
 	}
+	var resets []time.Time
 	if s.SevenDayPercentUsed != nil && *s.SevenDayPercentUsed >= cutoff {
 		if !s.SevenDayResetAt.IsZero() && !now.Before(s.SevenDayResetAt) && s.SampledAt.Before(s.SevenDayResetAt) {
-			return true
+			resets = append(resets, s.SevenDayResetAt)
 		}
 	} else if s.WeeklyPercentUsed >= cutoff {
 		if !s.ResetAt.IsZero() && !now.Before(s.ResetAt) && s.SampledAt.Before(s.ResetAt) {
-			return true
+			resets = append(resets, s.ResetAt)
 		}
 	}
 	if s.FiveHourPercentUsed != nil && *s.FiveHourPercentUsed >= fiveHourCutoff {
 		if !s.FiveHourResetAt.IsZero() && !now.Before(s.FiveHourResetAt) && s.SampledAt.Before(s.FiveHourResetAt) {
-			return true
+			resets = append(resets, s.FiveHourResetAt)
 		}
 	}
-	return false
+	return resets
 }
 
 func (s quotaSample) blocked(now time.Time, cutoff float64) bool {

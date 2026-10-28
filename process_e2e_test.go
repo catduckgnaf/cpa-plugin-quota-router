@@ -34,17 +34,22 @@ func TestCLIProxyAPIProcessEndToEnd(t *testing.T) {
 			http.Error(w, "missing beta header", http.StatusBadRequest)
 			return
 		}
-		utilization := 0
+		// The two accounts are deliberately asymmetric so the real-path
+		// test can tell the windows apart: token-a is over the five-hour
+		// cutoff only, token-b is over the seven-day cutoff only. With
+		// equal utilization or equal cutoffs this test could not verify
+		// independent 5h/7d gating.
+		var fiveHour, sevenDay int
 		switch strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ") {
 		case "e2e-token-a":
-			utilization = 52
+			fiveHour, sevenDay = 95, 20
 		case "e2e-token-b":
-			utilization = 80
+			fiveHour, sevenDay = 20, 95
 		default:
 			http.Error(w, "unknown token", http.StatusUnauthorized)
 			return
 		}
-		_, _ = fmt.Fprintf(w, `{"five_hour":{"utilization":%d,"resets_at":"2099-01-01T00:00:00Z"},"seven_day":{"utilization":%d,"resets_at":"2099-01-01T00:00:00Z"}}`, utilization, utilization)
+		_, _ = fmt.Fprintf(w, `{"five_hour":{"utilization":%d,"resets_at":"2099-01-01T00:00:00Z"},"seven_day":{"utilization":%d,"resets_at":"2099-01-01T00:00:00Z"}}`, fiveHour, sevenDay)
 	}))
 	defer usageServer.Close()
 
@@ -124,8 +129,8 @@ plugins:
       enabled: true
       priority: 100
       protected-models: ["claude-fable-*"]
-      cutoff-percent-used: 50
-      five-hour-cutoff-percent-used: 50
+      cutoff-percent-used: 88
+      five-hour-cutoff-percent-used: 94
       poll-interval: 50ms
       request-timeout: 1s
 `, port, proxyServer.URL, authDir, e2eAPIKey, e2eManagementKey, pluginDir)
@@ -169,15 +174,17 @@ plugins:
 	baseURL := fmt.Sprintf("http://127.0.0.1:%d", port)
 	client := &http.Client{Timeout: 2 * time.Second}
 	status := waitForProcessStatus(t, client, baseURL, processDone, &processErr, logPath, func(status cutoffStatusResponse) bool {
-		if !status.Enabled || len(status.ProtectedModels) != 1 || status.ProtectedModels[0] != "claude-fable-*" || status.CutoffPercentUsed != 50 || status.FiveHourCutoffPercentUsed != 50 || len(status.Accounts) != 2 {
+		if !status.Enabled || len(status.ProtectedModels) != 1 || status.ProtectedModels[0] != "claude-fable-*" || status.CutoffPercentUsed != 88 || status.FiveHourCutoffPercentUsed != 94 || len(status.Accounts) != 2 {
 			return false
 		}
-		for _, account := range status.Accounts {
-			if !account.Known || !account.Blocked {
-				return false
-			}
-		}
-		return true
+		// token-a (7d=20, 5h=95) is blocked by the 94% five-hour cutoff
+		// alone; token-b (7d=95, 5h=20) is blocked by the 88% seven-day
+		// cutoff alone. Both must be known and blocked.
+		fiveHourBlocked := e2eFindAccount(status, 20, 95)
+		sevenDayBlocked := e2eFindAccount(status, 95, 20)
+		return fiveHourBlocked != nil && sevenDayBlocked != nil &&
+			fiveHourBlocked.Known && fiveHourBlocked.Blocked &&
+			sevenDayBlocked.Known && sevenDayBlocked.Blocked
 	})
 	if len(status.Accounts) != 2 {
 		t.Fatalf("initial status = %#v", status)
@@ -238,8 +245,71 @@ drainProxyHits:
 		t.Fatalf("blocked request refreshed usage before reset: hits=%d, want %d", hits, startupUsageHits)
 	}
 
-	patch := []byte(`{"cutoff-percent-used":90,"five-hour-cutoff-percent-used":90}`)
-	request, err := http.NewRequest(http.MethodPatch, baseURL+"/v0/management/plugins/"+pluginName+"/config", bytes.NewReader(patch))
+	// Raising only the seven-day cutoff (88 -> 96, five-hour stays 94)
+	// must release token-b (7d=95, 5h=20) while token-a (7d=20, 5h=95)
+	// stays blocked by the five-hour window alone. This is the step that
+	// distinguishes the windows on the real path: a conflated
+	// single-window implementation would release both or neither.
+	patchE2EPluginConfig(t, client, baseURL, `{"cutoff-percent-used":96,"five-hour-cutoff-percent-used":94}`)
+
+	waitForProcessStatus(t, client, baseURL, processDone, &processErr, logPath, func(status cutoffStatusResponse) bool {
+		if status.CutoffPercentUsed != 96 || status.FiveHourCutoffPercentUsed != 94 || len(status.Accounts) != 2 {
+			return false
+		}
+		fiveHourBlocked := e2eFindAccount(status, 20, 95)
+		sevenDayBlocked := e2eFindAccount(status, 95, 20)
+		return fiveHourBlocked != nil && sevenDayBlocked != nil &&
+			fiveHourBlocked.Known && fiveHourBlocked.Blocked &&
+			sevenDayBlocked.Known && !sevenDayBlocked.Blocked
+	})
+
+	eligibleResponse := postClaudeMessage(t, client, baseURL, defaultProtectedModel)
+	if bytes.Contains(eligibleResponse, []byte(exhaustedErrorCode)) {
+		t.Fatalf("seven-day-released request remained cutoff-blocked: %s", eligibleResponse)
+	}
+	select {
+	case hit := <-proxyHits:
+		if !strings.Contains(hit, "api.anthropic.com:443") {
+			t.Fatalf("unexpected upstream proxy target: %s", hit)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("seven-day-released request never reached upstream proxy: %s\nserver log:\n%s", eligibleResponse, readLog(logPath))
+	}
+
+	// Raising the five-hour cutoff as well (94 -> 96) must then release
+	// token-a too, proving the five-hour gate controlled it independently.
+	patchE2EPluginConfig(t, client, baseURL, `{"cutoff-percent-used":96,"five-hour-cutoff-percent-used":96}`)
+
+	waitForProcessStatus(t, client, baseURL, processDone, &processErr, logPath, func(status cutoffStatusResponse) bool {
+		if status.CutoffPercentUsed != 96 || status.FiveHourCutoffPercentUsed != 96 || len(status.Accounts) != 2 {
+			return false
+		}
+		for _, account := range status.Accounts {
+			if !account.Known || account.Blocked {
+				return false
+			}
+		}
+		return true
+	})
+
+	eligibleResponse = postClaudeMessage(t, client, baseURL, defaultProtectedModel)
+	if bytes.Contains(eligibleResponse, []byte(exhaustedErrorCode)) {
+		t.Fatalf("eligible request remained cutoff-blocked: %s", eligibleResponse)
+	}
+	select {
+	case hit := <-proxyHits:
+		if !strings.Contains(hit, "api.anthropic.com:443") {
+			t.Fatalf("unexpected upstream proxy target: %s", hit)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("eligible request never reached upstream proxy: %s\nserver log:\n%s", eligibleResponse, readLog(logPath))
+	}
+	waitFor(t, func() bool { return e2eUsageHits.Load() > startupUsageHits })
+}
+
+func patchE2EPluginConfig(t *testing.T, client *http.Client, baseURL, patch string) {
+	t.Helper()
+	request, err := http.NewRequest(http.MethodPatch, baseURL+"/v0/management/plugins/"+pluginName+"/config", bytes.NewReader([]byte(patch)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -253,32 +323,21 @@ drainProxyHits:
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("patch plugin config: status=%d body=%s", response.StatusCode, responseBody)
 	}
+}
 
-	waitForProcessStatus(t, client, baseURL, processDone, &processErr, logPath, func(status cutoffStatusResponse) bool {
-		if status.CutoffPercentUsed != 90 || status.FiveHourCutoffPercentUsed != 90 || len(status.Accounts) != 2 {
-			return false
+// e2eFindAccount returns the status account with exactly these weekly
+// (seven-day) and five-hour percentages, or nil. The E2E fixtures give each
+// account a unique pair, so this identifies an account by the window values
+// it was served rather than by an ID assigned by the host.
+func e2eFindAccount(status cutoffStatusResponse, weekly, fiveHour float64) *cutoffAccountStatus {
+	for i := range status.Accounts {
+		account := &status.Accounts[i]
+		if account.WeeklyPercentUsed != nil && *account.WeeklyPercentUsed == weekly &&
+			account.FiveHourPercentUsed != nil && *account.FiveHourPercentUsed == fiveHour {
+			return account
 		}
-		for _, account := range status.Accounts {
-			if !account.Known || account.Blocked {
-				return false
-			}
-		}
-		return true
-	})
-
-	eligibleResponse := postClaudeMessage(t, client, baseURL, defaultProtectedModel)
-	if bytes.Contains(eligibleResponse, []byte(exhaustedErrorCode)) {
-		t.Fatalf("eligible request remained cutoff-blocked: %s", eligibleResponse)
 	}
-	select {
-	case hit := <-proxyHits:
-		if !strings.Contains(hit, "api.anthropic.com:443") {
-			t.Fatalf("unexpected upstream proxy target: %s", hit)
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatalf("eligible request never reached upstream proxy: %s\nserver log:\n%s", eligibleResponse, readLog(logPath))
-	}
-	waitFor(t, func() bool { return e2eUsageHits.Load() > startupUsageHits })
+	return nil
 }
 
 func cliProxyAPIModuleDir(t *testing.T) string {
